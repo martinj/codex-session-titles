@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Prevent recursion when this hook itself calls `codex exec`.
+if [[ "${CODEX_TITLE_GENERATOR_ACTIVE:-0}" == "1" ]]; then
+  exit 0
+fi
+
+PAYLOAD="${*: -1}"
+if [[ -z "$PAYLOAD" ]]; then
+  exit 0
+fi
+
+STATE_DIR="${CODEX_TITLE_HOME:-$HOME/.codex}/tmp"
+mkdir -p "$STATE_DIR"
+ERROR_FILE="$STATE_DIR/codex-session-title.last-error.log"
+
+if ! command -v jq >/dev/null 2>&1; then
+  printf '%s\n' "jq not found; install jq for codex-session-titles hook" >"$ERROR_FILE"
+  exit 0
+fi
+
+EVENT_TYPE="$(jq -r '.type // ""' <<<"$PAYLOAD" 2>/dev/null || true)"
+if [[ "$EVENT_TYPE" != "agent-turn-complete" ]]; then
+  exit 0
+fi
+
+INPUT_MESSAGE="$(jq -r '.["input-messages"][0] // ""' <<<"$PAYLOAD" 2>/dev/null || true)"
+LAST_ASSISTANT="$(jq -r '.["last-assistant-message"] // ""' <<<"$PAYLOAD" 2>/dev/null || true)"
+CWD_PATH="$(jq -r '.cwd // ""' <<<"$PAYLOAD" 2>/dev/null || true)"
+THREAD_ID="$(jq -r '.["thread-id"] // ""' <<<"$PAYLOAD" 2>/dev/null || true)"
+TURN_ID="$(jq -r '.["turn-id"] // ""' <<<"$PAYLOAD" 2>/dev/null || true)"
+
+if [[ -z "$INPUT_MESSAGE" ]]; then
+  INPUT_MESSAGE="Codex session"
+fi
+
+RUN_ID="${CODEX_TITLE_RUN_ID:?CODEX_TITLE_RUN_ID not set; launch via codex-title wrapper}"
+
+THREAD_KEY="$THREAD_ID"
+if [[ -z "$THREAD_KEY" ]]; then
+  THREAD_KEY="unknown-thread"
+fi
+THREAD_KEY="$(printf '%s' "$THREAD_KEY" | sed -E 's/[^A-Za-z0-9._-]+/_/g')"
+RUN_THREAD_MARKER="$STATE_DIR/codex-session-title.run.${RUN_ID}.thread.${THREAD_KEY}.done"
+
+# Avoid overlapping title-generation calls for the same run+thread.
+LOCK_DIR="${TMPDIR:-/tmp}/codex-title-hook.${RUN_ID}.${THREAD_KEY}.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  exit 0
+fi
+cleanup() {
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# Run title generation once per thread in each wrapper session.
+if [[ -f "$RUN_THREAD_MARKER" ]]; then
+  exit 0
+fi
+
+read -r -d '' GEN_PROMPT <<EOP || true
+You create short terminal titles for coding sessions.
+
+Rules:
+- Output exactly one line.
+- Max 44 characters.
+- No quotes, no markdown, no trailing punctuation.
+- Make it specific and actionable.
+
+Context:
+- cwd: $CWD_PATH
+- thread_id: $THREAD_ID
+- turn_id: $TURN_ID
+- user_message: $INPUT_MESSAGE
+- last_assistant_message: $LAST_ASSISTANT
+EOP
+
+sanitize() {
+  tr -d '\r' | tr '\n' ' ' | sed -E 's/[[:cntrl:]]//g; s/[[:space:]]+/ /g; s/^ +| +$//g; s/^"|"$//g; s/^`|`$//g'
+}
+
+GEN_ERR_FILE="$STATE_DIR/codex-session-title.last-generator-stderr.log"
+TITLE_RAW="$({
+  CODEX_TITLE_GENERATOR_ACTIVE=1 \
+  codex exec \
+    -m gpt-5.1-codex-mini \
+    -s read-only \
+    -c 'notify=[]' \
+    -c 'model_reasoning_effort="low"' \
+    "$GEN_PROMPT" 2>"$GEN_ERR_FILE" || true
+} | sed '/^[[:space:]]*$/d' | tail -n 1)"
+
+TITLE_CLEAN="$(printf '%s' "$TITLE_RAW" | sanitize)"
+if [[ -z "$TITLE_CLEAN" ]]; then
+  TITLE_CLEAN="$(printf '%s' "$INPUT_MESSAGE" | sanitize)"
+fi
+
+# Keep title compact and stable.
+TITLE_CLEAN="$(printf '%.44s' "$TITLE_CLEAN")"
+FINAL_TITLE="Codex: $TITLE_CLEAN"
+
+TTY_PATH="${CODEX_TITLE_TTY:-}"
+if [[ -n "$TTY_PATH" && -w "$TTY_PATH" ]]; then
+  printf '\033]2;%s\007' "$FINAL_TITLE" >"$TTY_PATH" 2>/dev/null || true
+  printf '\033]1;%s\007' "$FINAL_TITLE" >"$TTY_PATH" 2>/dev/null || true
+fi
+
+printf '%s\n' "$FINAL_TITLE" >"$STATE_DIR/codex-session-title.txt"
+
+: >"$RUN_THREAD_MARKER"
